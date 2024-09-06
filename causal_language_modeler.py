@@ -1,5 +1,5 @@
 ####################################################################################################
-# Author: H S V N S Kowndinya Renduchintala
+# Author: Kowndinya Renduchintala
 
 # This script can be used to either pre-train or finetune auto-regressive language models like Mistral, Llama2, Falcon, GPT-2 etc.
 # on causal language modeling (next-token prediction) objective. 
@@ -47,7 +47,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 import datasets
 from datasets import load_dataset, load_from_disk
-from huggingface_hub import HfApi
+from huggingface_hub import Repository, create_repo
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -62,6 +62,13 @@ from transformers import (
 from tqdm.auto import tqdm
 
 logger=get_logger(__name__)
+
+TORCH_DTYPES={
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "auto": "auto"
+}
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -125,7 +132,9 @@ def parse_args():
     parser.add_argument("--trust_remote_code", action="store_true", help="Whether to trust the execution of code from datasets/models defined on the Hub. This option should only be set to `True` for repositories you trust and in which you have read the code, as it will execute code present on the Hub on your local machine.")
     parser.add_argument("--hf_access_token", type=str, default="", help="HuggingFace access token")
     parser.add_argument("--model_type", type=str, default=None, help="Model type to use if training from scratch.", choices=MODEL_TYPES)
-    parser.add_argument("--model_name_or_path", type=str, default="mistralai/Mistral-7B-v0.1", help="Model name or path to local checkpoint")
+    parser.add_argument("--model_name_or_path", type=str, default=None, help="Model name or path to local checkpoint")
+    parser.add_argument("--torch_dtype", choices=["float32", "float16", "bfloat16", "auto"], default="auto", help="Torch dtype")
+    parser.add_argument("--use_flash_attention_2", action="store_true", help="Whether to use FlashAttention2")
     parser.add_argument("--config_name_or_path", type=str, default=None, help="Pretrained config name or path if not the same as model_name")
     parser.add_argument("--tokenizer_name_or_path", type=str, default=None, help="Pretrained tokenizer name or path if not the same as model_name")
     parser.add_argument("--use_slow_tokenizer", action="store_true", help="If passed, will use a slow tokenizer (not backed by the 🤗 Tokenizers library).")
@@ -144,9 +153,9 @@ def parse_args():
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
     parser.add_argument("--max_train_steps", type=int, default=None, help="Total number of training steps to perform. If provided, overrides num_train_epochs.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Whether to use gradient checkpointing")
     parser.add_argument("--lr_scheduler_type", type=SchedulerType, default="linear", help="The scheduler type to use.", choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"])
     parser.add_argument("--lr_warmup_fraction", type=float, default=0.01, help="Fraction of steps for the warmup in the lr scheduler.")
-    parser.add_argument("--mlm_probability", type=float, default=0.15, help="Ratio of tokens to mask for masked language modeling loss")
 
     # Parameters related to training: Reproducibility and resume training
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -207,9 +216,11 @@ def main():
             if repo_name is None:
                 repo_name=Path(args.output_dir).absolute().name
             # Create repo and retrieve repo_id
-            api=HfApi()
             is_private=args.private_repo
-            repo_id=api.create_repo(repo_name, exist_ok=True, token=args.hub_token, private=is_private).repo_id
+            repo_id=create_repo(repo_name, exist_ok=True, token=args.hub_token, private=is_private).repo_id
+
+            # Clone repo locally 
+            repo=Repository(args.output_dir, clone_from=repo_id, token=args.hub_token)
 
             with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
                 if "step_*" not in gitignore:
@@ -238,9 +249,9 @@ def main():
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    if args.tokenizer_name:
+    if args.tokenizer_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
+            args.tokenizer_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
         )
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -252,23 +263,37 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    torch_dtype=TORCH_DTYPES[args.torch_dtype]
     if args.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
+            torch_dtype=torch_dtype,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
             low_cpu_mem_usage=args.low_cpu_mem_usage,
             trust_remote_code=args.trust_remote_code,
+            use_flash_attention_2=args.use_flash_attention_2,
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=args.trust_remote_code)
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=args.trust_remote_code, torch_dtype=torch_dtype, use_flash_attention_2=args.use_flash_attention_2)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
+    
+    if args.gradient_checkpointing:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+        model.gradient_checkpointing_enable()
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -338,7 +363,7 @@ def main():
             load_from_cache_file=not args.overwrite_cache,
             desc=f"Grouping texts in chunks of {block_size}",
         )
-    
+
     train_dataset = lm_datasets["train"]
     eval_dataset = lm_datasets["validation"]
 
@@ -586,12 +611,10 @@ def main():
             )
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
-                api.upload_folder(
+                repo.push_to_hub(
                     commit_message=f"Training in progress epoch {epoch}",
-                    folder_path=args.output_dir,
-                    repo_id=repo_id,
-                    repo_type="model",
-                    token=args.hub_token,
+                    blocking=False,
+                    auto_lfs_prune=True
                 )
 
         if args.checkpointing_steps == "epoch":
@@ -612,12 +635,9 @@ def main():
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
             if args.push_to_hub:
-                api.upload_folder(
+                repo.push_to_hub(
                     commit_message="End of training",
-                    folder_path=args.output_dir,
-                    repo_id=repo_id,
-                    repo_type="model",
-                    token=args.hub_token,
+                    auto_lfs_prune=True
                 )
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 json.dump({"perplexity": perplexity}, f)
