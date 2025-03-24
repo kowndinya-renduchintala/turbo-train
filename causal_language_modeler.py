@@ -441,10 +441,6 @@ def main():
         # Log a few random samples from the training set:
         for index in random.sample(range(len(train_dataset)), 3):
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-    
-    # Log the total number of tokens in the training set - do not count padded tokens
-    total_tokens = sum(sum(x["attention_mask"]) for x in train_dataset)
-    logger.info(f"Total number of tokens in the training set: {total_tokens}")
 
     # Log trainable parameters
     logger.info(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
@@ -684,7 +680,6 @@ def main():
                     # Shift so that tokens < n predict n
                     shift_logits=logits[..., :-1, :].contiguous()
                     shift_labels=labels[..., 1:].contiguous()
-                    shift_token_weights=token_weights[..., 1:].contiguous()
 
                     # Flatten the tokens
                     shift_logits = shift_logits.view(-1, embedding_size)
