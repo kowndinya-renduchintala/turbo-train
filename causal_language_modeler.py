@@ -242,6 +242,26 @@ def main():
     # If passed along, set the training seed now
     if args.seed is not None:
         set_seed(args.seed)
+        # Add CUDA-specific seed settings
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # Set numpy random seed
+        import numpy as np
+        np.random.seed(args.seed)
+        # Set random seed
+        random.seed(args.seed)
+        # Set dataloader worker seed
+        def seed_worker(worker_id):
+            worker_seed = args.seed % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+            torch.manual_seed(worker_seed)
+            torch.cuda.manual_seed(worker_seed)
+            torch.cuda.manual_seed_all(worker_seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
     # Handle the output directory creation
     if accelerator.is_local_main_process:
@@ -448,10 +468,19 @@ def main():
     # Data Collator
     data_collator=DataCollatorForCausalLM(tokenizer)
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size, pin_memory=True, num_workers=8
+        train_dataset, 
+        shuffle=True, 
+        collate_fn=data_collator, 
+        batch_size=args.per_device_train_batch_size,
+        worker_init_fn=seed_worker if args.seed is not None else None,
+        generator=torch.Generator().manual_seed(args.seed) if args.seed is not None else None
     )
     eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size, pin_memory=True, num_workers=8
+        eval_dataset, 
+        collate_fn=data_collator, 
+        batch_size=args.per_device_eval_batch_size,
+        worker_init_fn=seed_worker if args.seed is not None else None,
+        generator=torch.Generator().manual_seed(args.seed) if args.seed is not None else None
     )
 
     # If using FSDP, prepare the model before the optimizer is instantiated
@@ -628,6 +657,9 @@ def main():
                             scaler = scaler.to(p.device)
                             p.grad *= scaler
                     
+                    # Clip gradients to prevent exploding gradients
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
                     optimizer.step()
                     optimizer.zero_grad()
                     lr_scheduler.step()
@@ -758,9 +790,6 @@ def main():
             if args.output_dir is not None:
                 output_dir=os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
-    
-    if args.with_tracking:
-        accelerator.end_training()
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
@@ -774,6 +803,9 @@ def main():
                 repo.push_to_hub(commit_message="End of Training", auto_lfs_prune=True)
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 json.dump({"perplexity": perplexity}, f)
+    
+    if args.with_tracking:
+        accelerator.end_training()
 
 if __name__=="__main__":
     main()
